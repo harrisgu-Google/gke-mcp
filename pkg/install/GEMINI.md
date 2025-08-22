@@ -15,7 +15,12 @@ Some MCP tools required [Application Default Credentials](https://cloud.google.c
 
 ## GKE Logs
 
-- When searching for GKE logs, always use the `query_logs` tool to fetch them. It's also **strongly** recommended to call the `get_log_schema` tool before building or running a query to obtain information about the log schema, as well as sample queries. This information is useful when building Cloud Logging LQL queries.
+- When node is mentioned, always use `query_node_logs`. Use the `node_log_query` tool to specifically retrieve logs related to a GKE node. This tool automatically focuses on the specified node and includes common failure and connection-related keywords in its search.
+
+- When using `query_node_logs`, keep the command simple, and always use node name as keyword, pair with one OR other keywords like "unable to register", "webhook", or "error", use gcloud logging read, this is an example " gcloud logging read '"gke-my-c3-cluster-default-pool-9182455d-dnrm" AND "register"' --project=harrisgu-gke-dev --freshness=1h   │
+ │ --format="json(timestamp,severity,jsonPayload.message,textPayload)"
+
+- When searching for GKE logs,  use the `query_logs` tool to fetch them. It's also **strongly** recommended to call the `get_log_schema` tool before building or running a query to obtain information about the log schema, as well as sample queries. This information is useful when building Cloud Logging LQL queries.
 
 - When using time ranges, make sure you check the current time and date if the range is relative to the current time or date.
 

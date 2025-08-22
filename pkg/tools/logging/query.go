@@ -278,3 +278,142 @@ func (f *goTemplateFormatter) format(entry *loggingpb.LogEntry) (string, error) 
 	}
 	return logLine.String(), nil
 }
+
+// NodeLogQueryRequest extends LogQueryRequest to include a node name and keywords for enhanced filtering.
+type NodeLogQueryRequest struct {
+	LogQueryRequest
+	NodeName string   `json:"node_name"`
+	Keywords []string `json:"keywords,omitempty"` // Optional keywords to search for
+}
+
+const (
+	// No hardcoded "node registration" keyword, now derived from user's Keywords or a default.
+	// Enhanced failureKeyword to include webhook and specific registration error messages
+	failureKeyword    = "failure|error|failed|webhook|unable to register node with api server" // Regex-like for highlighting
+	connectionKeyword = "connect|connection"
+)
+
+// installNodeLogQueryTool registers the tool with the server.
+func installNodeLogQueryTool(s *server.MCPServer, conf *config.Config) {
+	nodeLogQueryTool := mcp.NewTool("query_node_logs",
+		mcp.WithDescription("Query Google Cloud Platform logs for a specific GKE node using Logging Query Language (LQL). You can specify keywords to refine the search within the node's logs. This tool will automatically filter for common failure and connection related messages. Before using this tool, it's **strongly** recommended to call the 'get_log_schema' tool to get information about supported log types and their schemas. Logs are returned in ascending order, based on the timestamp (i.e. oldest first)."),
+		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithString("project_id", mcp.Description("GCP project ID to query logs from. Required."), mcp.Required()),
+		mcp.WithString("node_name", mcp.Description("The name of the GKE node to filter logs for (e.g., gke-my-c3-cluster-default-pool-9182455d-sgvs). Required."), mcp.Required()),
+		// Removed `keywords` parameter as it's now implicitly handled by failureKeyword
+		mcp.WithObject("time_range", mcp.Description("Time range for log query. If empty, no restrictions are applied."),
+			mcp.Properties(map[string]any{
+				"start_time": map[string]any{
+					"type":        "string",
+					"description": "Start time for log query (RFC3339 format)",
+				},
+				"end_time": map[string]any{
+					"type":        "string",
+					"description": "End time for log query (RFC3339 format)",
+				},
+			}),
+		),
+		mcp.WithString("since", mcp.Description("Only return logs newer than a relative duration like 5s, 2m, or 3h. The only supported units are seconds ('s'), minutes ('m'), and hours ('h').")),
+		mcp.WithNumber("limit", mcp.Description(fmt.Sprintf("Maximum number of log entries to return. Cannot be greater than %d. Consider multiple calls if needed. Defaults to %d.", maxLimit, defaultLimit))),
+		mcp.WithString("format", mcp.Description("Go template string to format each log entry. If empty, the full JSON representation is returned. Note that empty fields are not included in the response. Example: '{{.timestamp}} [{{.severity}}] {{.textPayload}}'. It's strongly recommended to use a template to minimize the size of the response and only include the fields you need. Use the get_schema tool before this tool to get information about supported log types and their schemas.")),
+	)
+
+	t := newNodeLogQueryTool(conf)
+	s.AddTool(nodeLogQueryTool, mcp.NewTypedToolHandler(t.queryNodeLogs))
+}
+
+// nodeLogQueryTool embeds queryLogsTool to reuse its core functionality.
+type nodeLogQueryTool struct {
+	*queryLogsTool // Embed the original queryLogsTool
+}
+
+func newNodeLogQueryTool(conf *config.Config) *nodeLogQueryTool {
+	return &nodeLogQueryTool{
+		queryLogsTool: newQueryLogsTool(conf), // Initialize the embedded tool
+	}
+}
+
+// highlightNodeLogs adds highlighting to the log output for failures and connection issues.
+func highlightNodeLogs(logOutput string) string {
+	lines := strings.Split(logOutput, "\n")
+	var highlightedLines []string
+	failureKeywordsSlice := strings.Split(failureKeyword, "|")
+	connectionKeywordsSlice := strings.Split(connectionKeyword, "|")
+
+	for _, line := range lines {
+		lowerLine := strings.ToLower(line)
+		originalLine := line // Keep original line for potential modification
+
+		isFailure := containsAny(lowerLine, failureKeywordsSlice)
+		isConnectionIssue := containsAny(lowerLine, connectionKeywordsSlice)
+
+		if isFailure && isConnectionIssue {
+			// Specific case if it's both a failure and connection (e.g., webhook failure to connect)
+			originalLine = fmt.Sprintf("🚨 FAILURE (CONNECTION ISSUE): %s", originalLine)
+		} else if isFailure {
+			originalLine = fmt.Sprintf("🚨 FAILURE: %s", originalLine)
+		} else if isConnectionIssue {
+			originalLine = fmt.Sprintf("⚠️ CONNECTION ISSUE: %s", originalLine)
+		}
+		highlightedLines = append(highlightedLines, originalLine)
+	}
+	return strings.Join(highlightedLines, "\n")
+}
+
+// containsAny checks if the string contains any of the given substrings.
+func containsAny(s string, substrs []string) bool {
+	for _, substr := range substrs {
+		if strings.Contains(s, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+// queryNodeLogs is the handler for the new tool.
+func (t *nodeLogQueryTool) queryNodeLogs(ctx context.Context, _ mcp.CallToolRequest, req NodeLogQueryRequest) (*mcp.CallToolResult, error) {
+	// Call setDefaults on the embedded LogQueryRequest
+	req.LogQueryRequest.setDefaults()
+
+	// Perform custom validation for NodeLogQueryRequest
+	if req.NodeName == "" {
+		return mcp.NewToolResultError("node_name parameter is required"), nil
+	}
+	// Also call the validation for the embedded LogQueryRequest
+	if errMsg := req.LogQueryRequest.validate(); errMsg != "" {
+		return mcp.NewToolResultError(errMsg), nil
+	}
+
+	// Build the LQL query filter
+	nodeFilter := fmt.Sprintf(`resource.labels.node_name="%s"`, req.NodeName)
+
+	// Construct the keyword filter directly from failureKeyword
+	failureKeywordsSlice := strings.Split(failureKeyword, "|")
+	var keywordQueries []string
+	for _, k := range failureKeywordsSlice {
+		keywordQueries = append(keywordQueries, fmt.Sprintf(`"%s"`, k))
+	}
+	keywordFilter := fmt.Sprintf(`(%s)`, strings.Join(keywordQueries, " OR "))
+
+	// Combine existing query with node and keyword filters
+	originalQuery := req.LogQueryRequest.Query
+	combinedQuery := nodeFilter
+	if keywordFilter != "" { // This will always be true now with failureKeyword
+		combinedQuery = fmt.Sprintf(`%s AND %s`, combinedQuery, keywordFilter)
+	}
+	if originalQuery != "" {
+		combinedQuery = fmt.Sprintf(`(%s) AND (%s)`, combinedQuery, originalQuery)
+	}
+	req.LogQueryRequest.Query = combinedQuery
+
+	// Use the embedded queryLogsTool's queryGCPLogs method
+	result, err := t.queryLogsTool.queryGCPLogs(ctx, req.LogQueryRequest)
+	if err != nil {
+		return mcp.NewToolResultErrorf("Query failed: %v", err), nil
+	}
+
+	// Highlight failures and connection issues
+	highlightedResult := highlightNodeLogs(result)
+
+	return mcp.NewToolResultText(highlightedResult), nil
+}

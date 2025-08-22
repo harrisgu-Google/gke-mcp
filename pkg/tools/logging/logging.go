@@ -25,6 +25,6 @@ import (
 func Install(_ context.Context, s *server.MCPServer, c *config.Config) error {
 	installQueryLogsTool(s, c)
 	installGetLogSchemas(s)
-
+	installNodeLogQueryTool(s, c)
 	return nil
 }
